@@ -1,0 +1,196 @@
+# =====================================================================
+# Windows 11 on VirtualBox (GitHub Actions) + Google Drive में सेव
+# ---------------------------------------------------------------------
+# फ़ाइल रखें: .github/workflows/windows11-vm.yml
+#
+# Settings > Secrets and variables > Actions में ये 5 secrets बनाएं:
+#   RCLONE_CONF  : आपकी rclone.conf की पूरी सामग्री (remote का नाम: gdrive)
+#   WIN_ISO      : Drive पर Windows 11 ISO का path, जैसे gdrive:isos/Win11.iso
+#   WIN_PASSWORD : Windows के अंदर के user (winuser) का पासवर्ड
+#   RDP_PASSWORD : RDP के पहले लॉगिन का पासवर्ड (मज़बूत रखें!)
+#   NGROK_TOKEN  : ngrok का authtoken (TCP tunnel के लिए account verify हो)
+#
+# चलाने के बाद: रन के Summary में RDP address दिखेगा.
+# RDP app में कनेक्ट करें: पहले user "runner" + RDP_PASSWORD,
+# फिर Windows की स्क्रीन पर winuser + WIN_PASSWORD.
+# =====================================================================
+name: Windows 11 VM
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"   # चेन टूट जाए तो बैकअप ट्रिगर
+
+concurrency:
+  group: win11-vm
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    env:
+      VM: win11
+      REMOTE: gdrive:win11-vm
+      VMDIR: /home/runner/vm
+      DEADLINE_MIN: "320"   # इतने मिनट बाद VM बंद करके Drive पर सेव
+
+    steps:
+      - name: Start time और disk साफ़ करो
+        run: |
+          echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Hardware check
+        run: |
+          nproc
+          free -m
+          echo "VT-x/AMD-V flags: $(grep -Ec '(vmx|svm)' /proc/cpuinfo)"
+          ls -l /dev/kvm || echo "no /dev/kvm"
+
+      - name: VirtualBox, rclone, ngrok install
+        run: |
+          echo "virtualbox-ext-pack virtualbox-ext-pack/license select true" | sudo debconf-set-selections
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            virtualbox virtualbox-ext-pack virtualbox-guest-additions-iso \
+            linux-headers-$(uname -r) zstd jq
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          curl -fsSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt-get update
+          sudo apt-get install -y ngrok
+          sudo modprobe -r kvm_intel kvm_amd kvm 2>/dev/null || true
+          sudo modprobe vboxdrv
+          sudo chmod 666 /dev/vboxdrv /dev/vboxdrvu 2>/dev/null || true
+          VBoxManage --version
+
+      - name: rclone config
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          rclone lsd gdrive: >/dev/null && echo "Drive connected"
+
+      - name: पुरानी VM restore करो या नई बनाओ
+        env:
+          WIN_ISO: ${{ secrets.WIN_ISO }}
+          WIN_PASSWORD: ${{ secrets.WIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$VMDIR"
+          VBoxManage setproperty machinefolder "$VMDIR"
+
+          if rclone lsf "$REMOTE" 2>/dev/null | grep -qx "$VM.tar.zst"; then
+            echo ">>> Drive से पुरानी VM restore हो रही है"
+            rclone cat "$REMOTE/$VM.tar.zst" --drive-chunk-size 128M | tar -I zstd -xf - -C "$VMDIR"
+            VBoxManage registervm "$VMDIR/$VM/$VM.vbox"
+            # पहली बार वाली install ISO अब नहीं चाहिए
+            for p in 1 2; do
+              VBoxManage storageattach "$VM" --storagectl SATA --port $p --device 0 \
+                --type dvddrive --medium emptydrive || true
+            done
+          else
+            echo ">>> पहली बार: नई Windows 11 VM बन रही है"
+            mkdir -p /tmp/iso
+            rclone copy "$WIN_ISO" /tmp/iso --drive-chunk-size 128M
+            ISO=$(ls /tmp/iso/*.iso | head -1)
+
+            VBoxManage createvm --name "$VM" --ostype Windows11_64 --register
+            VBoxManage modifyvm "$VM" --firmware efi --tpm-type 2.0 \
+              --graphicscontroller vboxsvga --vram 128 --nic1 nat \
+              --usbxhci on --mouse usbtablet
+            VBoxManage createmedium disk --filename "$VMDIR/$VM/$VM.vdi" --size 40960 --variant Standard
+            VBoxManage storagectl "$VM" --name SATA --add sata --controller IntelAhci
+            VBoxManage storageattach "$VM" --storagectl SATA --port 0 --device 0 --type hdd --medium "$VMDIR/$VM/$VM.vdi"
+            VBoxManage storageattach "$VM" --storagectl SATA --port 1 --device 0 --type dvddrive --medium emptydrive
+            VBoxManage storageattach "$VM" --storagectl SATA --port 2 --device 0 --type dvddrive --medium emptydrive
+
+            VBoxManage unattended install "$VM" --iso="$ISO" \
+              --user=winuser --password="$WIN_PASSWORD" --full-user-name="Win User" \
+              --install-additions --locale=en_US --time-zone=UTC --image-index=1
+          fi
+          echo "VM_READY=1" >> "$GITHUB_ENV"
+
+      - name: VM चालू करो + RDP tunnel
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          NGROK_TOKEN: ${{ secrets.NGROK_TOKEN }}
+        run: |
+          set -euo pipefail
+          CPUS=$(( $(nproc) > 2 ? $(nproc) - 1 : 2 ))
+          MEM=$(( $(free -m | awk '/^Mem:/{print $2}') - 3072 ))
+          [ "$MEM" -lt 4096 ] && MEM=4096
+          echo "VM को मिलेगा: $CPUS CPU, $MEM MB RAM"
+
+          # VirtualBox का RDP, host user "runner" के पासवर्ड से
+          echo "runner:$RDP_PASSWORD" | sudo chpasswd
+          VBoxManage modifyvm "$VM" --cpus "$CPUS" --memory "$MEM" \
+            --vrde on --vrdeport 3389 --vrdeauthtype external
+          # अगर login न चले तो ऊपर की जगह --vrdeauthtype null आज़माएं
+          # (तब सिर्फ Windows का पासवर्ड बचाएगा)
+
+          VBoxManage startvm "$VM" --type headless
+
+          ngrok config add-authtoken "$NGROK_TOKEN"
+          nohup ngrok tcp 3389 --log=stdout > /tmp/ngrok.log 2>&1 &
+          ADDR=""
+          for i in $(seq 1 20); do
+            ADDR=$(curl -s localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url // empty') || true
+            [ -n "$ADDR" ] && break
+            sleep 3
+          done
+          [ -n "$ADDR" ] || { cat /tmp/ngrok.log; exit 1; }
+          ADDR=${ADDR#tcp://}
+
+          echo "::notice title=RDP address::$ADDR (user: runner)"
+          {
+            echo "### Windows 11 RDP"
+            echo "Address: \`$ADDR\`"
+            echo "पहला login: runner + RDP_PASSWORD"
+            echo "फिर Windows: winuser + WIN_PASSWORD"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: VM चलने दो
+        run: |
+          END=$(( T0 + DEADLINE_MIN * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if ! VBoxManage showvminfo "$VM" --machinereadable | grep -q '^VMState="running"'; then
+              echo "VM बंद हो गई (शायद Windows के अंदर से shutdown हुई)"
+              break
+            fi
+            sleep 30
+          done
+
+      - name: VM बंद करो + Google Drive पर सेव
+        if: always() && env.VM_READY == '1'
+        run: |
+          set -euo pipefail
+          if VBoxManage showvminfo "$VM" --machinereadable | grep -q '^VMState="running"'; then
+            VBoxManage controlvm "$VM" acpipowerbutton || true
+            for i in $(seq 1 60); do
+              VBoxManage showvminfo "$VM" --machinereadable | grep -q '^VMState="running"' || break
+              sleep 5
+            done
+            VBoxManage controlvm "$VM" poweroff 2>/dev/null || true
+            sleep 5
+          fi
+          pkill ngrok || true
+
+          echo ">>> compress करके Drive पर अपलोड"
+          tar -I 'zstd -T0 -3' -cf - -C "$VMDIR" "$VM" \
+            | rclone rcat "$REMOTE/$VM.tar.zst" --drive-chunk-size 256M
+          rclone size "$REMOTE"
+
+      - name: अगला रन शुरू करो
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run "Windows 11 VM" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
